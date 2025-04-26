@@ -1,0 +1,465 @@
+From b339083f23b27ea625b9c6d803206d3d51cd9cbb Mon Sep 17 00:00:00 2001
+From: sarza-exe <sarazynd@gmail.com>
+Date: Sun, 12 Jan 2025 18:03:47 +0100
+Subject: [PATCH] lista6_zad_1_2_3
+
+---
+ Makefile   |  7 ++++++-
+ console.c  | 21 ++++++++++++++++++++
+ defs.h     |  1 +
+ exec.c     |  5 +++++
+ proc.c     |  4 ++++
+ syscall.c  |  6 ++++++
+ syscall.h  |  3 +++
+ sysproc.c  | 29 ++++++++++++++++++++++++++++
+ testmmap.c | 42 ++++++++++++++++++++++++++++++++++++++++
+ testused.c | 22 +++++++++++++++++++++
+ testvm.c   | 17 +++++++++++++++++
+ user.h     |  3 +++
+ usys.S     |  3 +++
+ vm.c       | 56 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ xv6.patch  | 29 ++++++++++++++++++++++++++++
+ 15 files changed, 247 insertions(+), 1 deletion(-)
+ create mode 100644 testmmap.c
+ create mode 100644 testused.c
+ create mode 100644 testvm.c
+ create mode 100644 xv6.patch
+
+diff --git a/Makefile b/Makefile
+index 09d790c..c8f4ef9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -76,7 +76,7 @@ AS = $(TOOLPREFIX)gas
+ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+-CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -mno-sse -ggdb -m32 -fno-omit-frame-pointer
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+@@ -116,6 +116,7 @@ entryother: entryother.S
+ 
+ initcode: initcode.S
+ 	$(CC) $(CFLAGS) -nostdinc -I. -c initcode.S
++	$(OBJCOPY) --remove-section .note.gnu.property initcode.o
+ 	$(LD) $(LDFLAGS) -N -e start -Ttext 0 -o initcode.out initcode.o
+ 	$(OBJCOPY) -S -O binary initcode.out initcode
+ 	$(OBJDUMP) -S initcode.o > initcode.asm
+@@ -146,6 +147,7 @@ vectors.S: vectors.pl
+ ULIB = ulib.o usys.o printf.o umalloc.o
+ 
+ _%: %.o $(ULIB)
++	$(OBJCOPY) --remove-section .note.gnu.property ulib.o
+ 	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $@ $^
+ 	$(OBJDUMP) -S $@ > $*.asm
+ 	$(OBJDUMP) -t $@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $*.sym
+@@ -181,6 +183,9 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_testvm\
++	_testused\
++	_testmmap\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/console.c b/console.c
+index a280d2b..97400f3 100644
+--- a/console.c
++++ b/console.c
+@@ -24,6 +24,17 @@ static struct {
+   int locking;
+ } cons;
+ 
++  static const char *color_codes[] = {
++    "\033[0m",   // Reset
++    "\033[31m",  // Red
++    "\033[32m",  // Green
++    "\033[33m",  // Yellow
++    "\033[34m",  // Blue
++    "\033[35m",  // Magenta
++    "\033[36m",  // Cyan
++    "\033[37m"   // White
++  };
++
+ static void
+ printint(int xx, int base, int sign)
+ {
+@@ -51,6 +62,7 @@ printint(int xx, int base, int sign)
+ //PAGEBREAK: 50
+ 
+ // Print to the console. only understands %d, %x, %p, %s.
++// ... means it's a variadic function
+ void
+ cprintf(char *fmt, ...)
+ {
+@@ -65,6 +77,7 @@ cprintf(char *fmt, ...)
+   if (fmt == 0)
+     panic("null fmt");
+ 
++  //argp is a pointer to memory address after &fmt. it's a variadic arg
+   argp = (uint*)(void*)(&fmt + 1);
+   for(i = 0; (c = fmt[i] & 0xff) != 0; i++){
+     if(c != '%'){
+@@ -88,6 +101,14 @@ cprintf(char *fmt, ...)
+       for(; *s; s++)
+         consputc(*s);
+       break;
++    case 'c':
++      int color_code = *argp++;
++      if(color_code >= 0 && color_code < sizeof(color_codes)/sizeof(color_codes[0])) {
++        s = (char *)color_codes[color_code];
++        while(*s)
++          consputc(*s++);
++      }
++      break;
+     case '%':
+       consputc('%');
+       break;
+diff --git a/defs.h b/defs.h
+index 82fb982..70799c0 100644
+--- a/defs.h
++++ b/defs.h
+@@ -185,6 +185,7 @@ void            switchuvm(struct proc*);
+ void            switchkvm(void);
+ int             copyout(pde_t*, uint, void*, uint);
+ void            clearpteu(pde_t *pgdir, char *uva);
++int             countphysicalpages(pde_t *pgdir, uint sz);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/exec.c b/exec.c
+index b40134f..264b48d 100644
+--- a/exec.c
++++ b/exec.c
+@@ -101,6 +101,11 @@ exec(char *path, char **argv)
+   curproc->tf->esp = sp;
+   switchuvm(curproc);
+   freevm(oldpgdir);
++
++  //MODIFICATION
++  cprintf("exec - ");
++  vmprint(pgdir);
++
+   return 0;
+ 
+  bad:
+diff --git a/proc.c b/proc.c
+index 806b1b1..cc37713 100644
+--- a/proc.c
++++ b/proc.c
+@@ -242,6 +242,10 @@ exit(void)
+     }
+   }
+ 
++  //MODIFICATION. Pass pgdir of the current process
++  cprintf("exit - ");
++  vmprint(curproc->pgdir);
++
+   begin_op();
+   iput(curproc->cwd);
+   end_op();
+diff --git a/syscall.c b/syscall.c
+index ee85261..75b6e12 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,9 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_usedvp(void);
++extern int sys_usedpp(void);
++extern int sys_mmap(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +129,9 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_usedvp]  sys_usedvp,
++[SYS_usedpp]  sys_usedpp,
++[SYS_mmap]    sys_mmap,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..f1625fc 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_usedvp 22
++#define SYS_usedpp 23
++#define SYS_mmap   24
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..6fbd72b 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -89,3 +89,32 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++int sys_usedvp(void) {
++  //sz - size of process memory in bytes
++  //PGSIZE - 4 MB
++  return myproc()->sz / PGSIZE + 1; // Rozmiar procesu w stronach + 1 strona ochrony stosu
++}
++
++int sys_usedpp(void) {
++  return countphysicalpages(myproc()->pgdir, myproc()->sz);
++}
++
++int sys_mmap(void) {
++  int numpages;
++  //argint(n,*ip) gets the n-th int argument (from syscall.c)
++  if(argint(0, &numpages) == -1 || numpages <= 0 || numpages % PGSIZE != 0){
++    return 0;
++  }
++
++  struct proc *curproc = myproc();
++  uint newsz = curproc->sz + numpages;
++  
++  if(newsz > KERNBASE){
++    return 0; // Available memory range exceeded
++  }
++
++  curproc->sz = newsz; //Extend process address space
++
++  return curproc->sz;
++}
+\ No newline at end of file
+diff --git a/testmmap.c b/testmmap.c
+new file mode 100644
+index 0000000..2e00050
+--- /dev/null
++++ b/testmmap.c
+@@ -0,0 +1,42 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++int main() {
++    int used_virtual, used_physical;
++    
++    // Wydrukowanie początkowej liczby stron
++    used_virtual = usedvp();
++    used_physical = usedpp();
++    printf(1, "Liczba stron wirtualnych: %d\n", used_virtual);
++    printf(1, "Liczba stron fizycznych: %d\n", used_physical);
++
++    // Testowanie mmap (rozszerzamy o 1 stronę)
++    int addr = mmap(4096);
++    printf(1, "Po mmap (1 strona) nowy adres: %p\n", addr);
++
++    used_virtual = usedvp();
++    used_physical = usedpp();
++    printf(1, "Liczba stron wirtualnych: %d\n", used_virtual);
++    printf(1, "Liczba stron fizycznych: %d\n", used_physical);
++
++    // Testowanie mmap (rozszerzamy o kolejne 2 strony)
++    addr = mmap(2 * 4096);
++    printf(1, "Po mmap (2 strony) nowy adres: %p\n", addr);
++
++    used_virtual = usedvp();
++    used_physical = usedpp();
++    printf(1, "Liczba stron wirtualnych: %d\n", used_virtual);
++    printf(1, "Liczba stron fizycznych: %d\n", used_physical);
++
++    // Testowanie mmap (rozszerzamy o 5 stron)
++    addr = mmap(5 * 4096);
++    printf(1, "Po mmap (5 stron) nowy adres: %p\n", addr);
++
++    used_virtual = usedvp();
++    used_physical = usedpp();
++    printf(1, "Liczba stron wirtualnych: %d\n", used_virtual);
++    printf(1, "Liczba stron fizycznych: %d\n", used_physical);
++
++    exit();
++}
+diff --git a/testused.c b/testused.c
+new file mode 100644
+index 0000000..f4c55b3
+--- /dev/null
++++ b/testused.c
+@@ -0,0 +1,22 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++int main() {
++  int used_virtual = usedvp();
++  int used_physical = usedpp();
++
++  printf(1, "Liczba uzytych stron wirtualnych: %d\n", used_virtual);
++  printf(1, "Liczba uzytych stron fizycznych: %d\n", used_physical);
++
++  // Przydziel pamięć, aby sprawdzić, czy liczniki się zmieniają
++  sbrk(4096);
++  used_virtual = usedvp();
++  used_physical = usedpp();
++
++  printf(1, "Po przydzieleniu jednej strony:\n");
++  printf(1, "Liczba uzytych stron wirtualnych: %d\n", used_virtual);
++  printf(1, "Liczba uzytych stron fizycznych: %d\n", used_physical);
++
++  exit();
++}
+\ No newline at end of file
+diff --git a/testvm.c b/testvm.c
+new file mode 100644
+index 0000000..1a9bbca
+--- /dev/null
++++ b/testvm.c
+@@ -0,0 +1,17 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++/*
++sbrk modifies the size of the heap of the calling process
++it modifies proc->sz, where sz is process's memory size
++*/
++int main() {
++  for (int i = 0; i < 5; i++) {
++    if (sbrk(4096) == -1) { // sbrk defined in sysproc.c
++      printf(2, "sbrk failed\n");
++      exit();
++    }
++  }
++  exit();
++}
+diff --git a/user.h b/user.h
+index 4f99c52..fd0d25b 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,9 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int usedvp(void);
++int usedpp(void);
++int mmap(uint);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..d26246b 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,6 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(usedvp)
++SYSCALL(usedpp)
++SYSCALL(mmap)
+diff --git a/vm.c b/vm.c
+index 7134cff..2a17b0b 100644
+--- a/vm.c
++++ b/vm.c
+@@ -385,6 +385,62 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
+   return 0;
+ }
+ 
++/*
++Virtual Memory print
++pgdir is page table of the process
++page table stores mappings between virtual and physical addresses
++PDE - Page directory entry
++PTE - Page table entry (stores: size of physical memory, physical address 
++of the page, Present/Absent bit, read/write permissions, modified bit)
++pde - indeks PDE w jego katalogu stron
++pa - adres fizyczny dla pde
++HIERARCHY: page directory entry -> page table page -> page table entry
++*/
++void vmprint(pde_t *pgdir) {
++  if(pgdir == 0) 
++    panic("vmprint: no pgdir"); // wziete z freevm()
++
++  cprintf("pgdir %p\n", pgdir); // console print. %p prints pointer address in hex
++
++  for (int i = 0; i < 512; i++) { // sprawdzamy 512 wpisow PDE
++    if (pgdir[i] & PTE_P) { // sprawdzenie czy wpis jest obecny
++      uint pa = PTE_ADDR(pgdir[i]); //Physical Address in page table or page directory entry
++      cprintf(".. %d: pde %p pa %p\n", i, pgdir[i], pa);
++
++      pte_t *pt = (pte_t *)P2V(pa); // Pointer to Page Table. Pobranie tabeli stron
++      for (int j = 0; j < 1024; j++) { // sprawdzamy 1024 wpisow PTE
++        if (pt[j] & PTE_P) { // Sprawdzenie, czy wpis jest obecny
++          uint pte_pa = PTE_ADDR(pt[j]);
++          cprintf(".. .. %d: pte 0x%p pa 0x%p\n", j, pt[j], pte_pa);
++        }
++      }
++    }
++  }
++}
++
++int countphysicalpages(pde_t *pgdir, uint sz) 
++{
++  int count = 0;
++  pte_t *pte;
++  uint va = 0;
++
++  while(1) 
++  {
++    pte = walkpgdir(pgdir, (void *)va, 0);
++    // check if it exists and is mapped
++    if (pte && (*pte & PTE_P)) 
++    {
++        count++;
++        va += PGSIZE;
++    }
++    else break;
++  }
++
++  return count;
++}
++
++
++
+ //PAGEBREAK!
+ // Blank page.
+ //PAGEBREAK!
+diff --git a/xv6.patch b/xv6.patch
+new file mode 100644
+index 0000000..671aacd
+--- /dev/null
++++ b/xv6.patch
+@@ -0,0 +1,29 @@
++diff --git a/Makefile b/Makefile
++index 09d790c..3f4dbb7 100644
++--- a/Makefile
+++++ b/Makefile
++@@ -76,7 +76,7 @@ AS = $(TOOLPREFIX)gas
++ LD = $(TOOLPREFIX)ld
++ OBJCOPY = $(TOOLPREFIX)objcopy
++ OBJDUMP = $(TOOLPREFIX)objdump
++-CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
+++CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -mno-sse -ggdb -m32 -fno-omit-frame-pointer
++ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
++ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
++ # FreeBSD ld wants ``elf_i386_fbsd''
++@@ -116,6 +116,7 @@ entryother: entryother.S
++ 
++ initcode: initcode.S
++ 	$(CC) $(CFLAGS) -nostdinc -I. -c initcode.S
+++	$(OBJCOPY) --remove-section .note.gnu.property initcode.o
++ 	$(LD) $(LDFLAGS) -N -e start -Ttext 0 -o initcode.out initcode.o
++ 	$(OBJCOPY) -S -O binary initcode.out initcode
++ 	$(OBJDUMP) -S initcode.o > initcode.asm
++@@ -146,6 +147,7 @@ vectors.S: vectors.pl
++ ULIB = ulib.o usys.o printf.o umalloc.o
++ 
++ _%: %.o $(ULIB)
+++	$(OBJCOPY) --remove-section .note.gnu.property ulib.o
++ 	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $@ $^
++ 	$(OBJDUMP) -S $@ > $*.asm
++ 	$(OBJDUMP) -t $@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $*.sym
+-- 
+2.34.1
+
